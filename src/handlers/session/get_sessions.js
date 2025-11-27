@@ -2,7 +2,7 @@ const Session = require('../../models/session')
 const get_sessions = async (req, res) => {
     try {
         const { userId } = req.user
-        const sessions = await Session.find({ userId: userId })
+        const sessions = await Session.find({ userId: userId }).sort({_id:-1})
         res.status(200).json({ message: 'Sessions fetched successfully.', sessions })
     }
     catch (err) {
