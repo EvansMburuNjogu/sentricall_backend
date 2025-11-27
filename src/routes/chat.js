@@ -15,5 +15,5 @@ router.delete('/delete_chat/:chatId',delete_chat)
 router.get('/get_chats',get_chats)
 router.get('/get_chat/:chatId',get_chat)
 router.get('/get_chat_conversations/:chatId',get_chat_conversations)
-router.post('/:chatId/ask', ask_chat);
+router.post('/ask_chat/:chatId/ask', ask_chat);
 module.exports = router;
