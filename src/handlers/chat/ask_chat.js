@@ -8,7 +8,7 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_KEY
 });
 
-module.exports = async function ask_chat(req, res) {
+const ask_chat = async (req, res) =>{
   try {
     // -----------------------------
     // 1. BASIC VALIDATION
@@ -241,3 +241,5 @@ SAFETY GUIDELINES:
     });
   }
 };
+
+module.exports = ask_chat

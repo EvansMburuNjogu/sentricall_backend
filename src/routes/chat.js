@@ -5,6 +5,7 @@ const delete_chat = require('../handlers/chat/delete_chat');
 const get_chats = require('../handlers/chat/get_chats');
 const get_chat = require('../handlers/chat/get_chat');
 const get_chat_conversations = require('../handlers/chat/get_chat_conversations');
+const ask_chat = require('../handlers/chat/ask_chat');
 const router = express();
 
 router.use(authenticateJWT)
