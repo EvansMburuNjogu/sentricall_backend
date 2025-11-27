@@ -48,7 +48,7 @@ const create_session = async (req, res) => {
       type,                 // one of the 4 enums
       websiteUrl: null,     // filled after scan for website_link
       initialScanSummary: null,
-      initialScanRiskLevel: 'unknown',
+      initialScanRiskLevel: 'UNKNOWN',
     });
 
     return res.status(201).json({

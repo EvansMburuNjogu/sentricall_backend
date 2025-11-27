@@ -25,7 +25,7 @@ const SessionSchema = new mongoose.Schema(
     type: {
       type: String,
       required: true,
-      enum: ['listen_audio', 'upload_media', 'website_link', 'screen_record'],
+      enum: ['listen_audio', 'upload_media', 'website_link', 'record_screen'],
       index: true,
     },
 

@@ -6,6 +6,7 @@ const get_sessions = require('../handlers/session/get_sessions');
 const get_session = require('../handlers/session/get_session');
 const get_session_conversations = require('../handlers/session/get_session_conversations');
 const scan_website = require('../handlers/session/scan_website');
+const ask_session = require('../handlers/session/ask_session');
 const router = express();
 
 router.use(authenticateJWT)
@@ -16,4 +17,5 @@ router.get('/get_sessions',get_sessions)
 router.get('/get_session/:sessionId',get_session)
 router.get('/get_session_conversations/:sessionId',get_session_conversations)
 router.post('/scan_website/:sessionId', scan_website);
+router.post('/ask_session/:sessionId', ask_session);
 module.exports = router;
