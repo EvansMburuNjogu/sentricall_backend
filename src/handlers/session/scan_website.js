@@ -59,8 +59,7 @@ Then respond ONLY with the JSON described above.
       { role: 'system', content: systemPrompt },
       { role: 'user', content: userPrompt },
     ],
-    // Conceptually this is our "deepsearch" – model is allowed to browse.
-    // If you later switch to the Responses API with web_search, do it here.
+    // later you can swap to Responses API with web_search here
   });
 
   const raw = completion.choices?.[0]?.message?.content?.trim() || '{}';
@@ -102,7 +101,7 @@ Then respond ONLY with the JSON described above.
  *
  * - Validates session belongs to user
  * - Runs deepsearch-style scan
- * - Updates Session: websiteUrl, initialScanSummary, initialScanRiskLevel
+ * - Updates Session: websiteUrl, initialScanSummary, initialScanRiskLevel, scanned
  * - Saves a Conversation (type=session, role=assistant)
  * - Returns updated session + summary + riskLevel
  */
@@ -143,7 +142,7 @@ const scan_website = async (req, res) => {
       return res.status(404).json({ message: 'Session not found' });
     }
 
-    // Run "deepsearch" scan
+    // Run "deepsearch" scan (if this throws, we DON'T mark scanned)
     const { summary, riskLevel, redFlags } =
       await deepsearchScanWebsite(cleanUrl);
 
@@ -151,6 +150,8 @@ const scan_website = async (req, res) => {
     session.websiteUrl = cleanUrl;
     session.initialScanSummary = summary;
     session.initialScanRiskLevel = riskLevel;
+    session.scanned = true; // ✅ mark as scanned because AI returned a result
+
     await session.save();
 
     // Save a conversation message linked to this session
