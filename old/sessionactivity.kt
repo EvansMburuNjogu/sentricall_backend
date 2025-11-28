@@ -1,618 +1,1299 @@
 package com.ke.sentricall
 
+import android.Manifest
+import android.app.Activity
+import android.app.AlertDialog
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Color
-import android.net.ConnectivityManager
-import android.net.NetworkCapabilities
-import android.os.Build
+import android.media.MediaPlayer
+import android.media.MediaRecorder
+import android.net.Uri
 import android.os.Bundle
-import android.text.TextUtils
-import android.util.Log
-import android.view.Gravity
+import android.os.Environment
+import android.os.Handler
+import android.os.Looper
+import android.provider.OpenableColumns
+import android.text.Spannable
+import android.text.SpannableString
+import android.text.style.ForegroundColorSpan
 import android.view.View
-import android.view.ViewGroup
-import android.widget.Button
-import android.widget.LinearLayout
-import android.widget.ProgressBar
+import android.widget.CheckBox
+import android.widget.EditText
+import android.widget.ImageButton
+import android.widget.ImageView
 import android.widget.TextView
 import android.widget.Toast
-import androidx.appcompat.app.AlertDialog
+import android.widget.VideoView
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
-import androidx.fragment.app.Fragment
+import androidx.core.content.FileProvider
 import com.google.android.material.button.MaterialButton
+import com.google.android.material.card.MaterialCardView
 import com.google.android.material.textfield.TextInputEditText
 import com.google.android.material.textfield.TextInputLayout
-import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import kotlin.math.log10
+import kotlin.random.Random
 
-class CopilotFragment : Fragment(R.layout.fragment_copilot) {
-
-    // All views nullable to avoid crashes if not found
-    private var btnNewChat: MaterialButton? = null
-    private var containerChats: LinearLayout? = null
-    private var containerSessions: LinearLayout? = null
-    private var itemChatSample: View? = null
-    private var itemSessionSample: View? = null
-    private var progressLoading: ProgressBar? = null
+class SessionActivity : AppCompatActivity(), ScreenRecordingService.RecordingCallback {
 
     companion object {
-        private const val TAG = "CopilotFragment"
+        const val EXTRA_SESSION_TYPE_ID = "extra_session_type_id"
+        const val EXTRA_SESSION_TITLE = "extra_session_title"
+        const val EXTRA_SESSION_SUBTITLE = "extra_session_subtitle"
+        const val EXTRA_SESSION_ID = "session_id_extra"
     }
 
-    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
-        super.onViewCreated(view, savedInstanceState)
-        Log.d(TAG, "onViewCreated")
+    // UI
+    private lateinit var btnBack: ImageButton
+    private lateinit var tvSessionHeaderTitle: TextView
+    private lateinit var tvSessionHeaderSubtitle: TextView
 
-        // Bind views safely
-        btnNewChat = view.findViewById(R.id.btnNewChat)
-        containerChats = view.findViewById(R.id.containerChats)
-        containerSessions = view.findViewById(R.id.containerSessions)
-        itemChatSample = view.findViewById(R.id.itemChatSample)
-        itemSessionSample = view.findViewById(R.id.itemSessionSample)
-        progressLoading = view.findViewById(R.id.progressLoading)
+    private lateinit var imgSessionIcon: ImageView
+    private lateinit var tvSessionTypeTitle: TextView
+    private lateinit var tvSessionTypeBody: TextView
 
-        // Hide sample items – we render real data
-        itemChatSample?.visibility = View.GONE
-        itemSessionSample?.visibility = View.GONE
+    private lateinit var audioSpectrumView: AudioSpectrumView
+    private lateinit var tvSessionTimer: TextView
 
-        // New AI chat → open custom dialog
-        btnNewChat?.setOnClickListener {
-            if (!isOnline()) {
-                Toast.makeText(requireContext(), "No internet connection", Toast.LENGTH_SHORT).show()
-                return@setOnClickListener
+    private lateinit var cardSessionType: MaterialCardView
+    private lateinit var cardAiAnalysis: MaterialCardView
+    private lateinit var tvAiAnalysisTitle: TextView
+    private lateinit var tvAiAnalysisBody: TextView
+    private lateinit var tvOpenAiChatLink: TextView
+
+    // Upload UI
+    private lateinit var layoutFileUpload: MaterialCardView
+    private lateinit var tvFileUploadHint: TextView
+
+    // Website URL UI
+    private lateinit var layoutWebsiteUrl: TextInputLayout
+    private lateinit var etWebsiteUrl: TextInputEditText
+
+    private lateinit var btnStartStop: MaterialButton
+
+    private lateinit var cardLastRecording: MaterialCardView
+    private lateinit var btnPlayLastRecording: ImageButton
+    private lateinit var tvLastRecordingTitle: TextView
+    private lateinit var tvLastRecordingSubtitle: TextView
+
+    private lateinit var btnReportSession: MaterialButton
+
+    // State
+    private var sessionMode: SessionMode = SessionMode.LISTEN_AUDIO
+
+    // Session ID (for backend + AI chat)
+    private var sessionId: String? = null
+
+    // --- Audio listen state ---
+    private var isListening = false
+    private var mediaRecorder: MediaRecorder? = null
+    private var audioOutputPath: String? = null
+    private var audioStartTime: Long = 0L
+    private var lastRecordingDurationSec: Int = 0
+
+    // Playback for last saved audio
+    private var playbackPlayer: MediaPlayer? = null
+    private var isPlayingRecording: Boolean = false
+
+    // Mic permission
+    private var pendingStartAfterPermission = false
+
+    // Timer for audio recording
+    private val timerHandler = Handler(Looper.getMainLooper())
+    private val timerRunnable = object : Runnable {
+        override fun run() {
+            if (!isListening) return
+            val elapsed = System.currentTimeMillis() - audioStartTime
+            val seconds = (elapsed / 1000).toInt()
+            lastRecordingDurationSec = seconds
+            val mins = seconds / 60
+            val secs = seconds % 60
+            tvSessionTimer.text = String.format("%02d:%02d", mins, secs)
+            timerHandler.postDelayed(this, 1000L)
+        }
+    }
+
+    // Spectrum animation driven by mic levels (ORIGINAL)
+    private val spectrumHandler = Handler(Looper.getMainLooper())
+    private var lastNormLevel: Float = 0f
+    private val spectrumRunnable = object : Runnable {
+        override fun run() {
+            if (!isListening || mediaRecorder == null) return
+
+            val amp = mediaRecorder?.maxAmplitude ?: 0
+            val silenceThreshold = 1500
+
+            val rawNorm = if (amp <= silenceThreshold) {
+                0f
+            } else {
+                val db = 20 * log10(amp.toDouble() / 32767.0).toFloat()
+                ((db + 40f) / 40f).coerceIn(0f, 1f)
             }
-            showNewChatDialog()
+
+            val smoothed = 0.7f * lastNormLevel + 0.3f * rawNorm
+            lastNormLevel = smoothed
+
+            val barCount = 48
+            val base = lastNormLevel
+
+            val levels = if (base <= 0.01f) {
+                FloatArray(barCount) { 0f }
+            } else {
+                FloatArray(barCount) { index ->
+                    val center = (barCount - 1) / 2f
+                    val dist = kotlin.math.abs(index - center)
+                    val falloff = (1f - dist / center).coerceIn(0.4f, 1f)
+                    val jitter = (Random.nextFloat() - 0.5f) * 0.15f
+                    (base * falloff + jitter).coerceIn(0f, 1f)
+                }
+            }
+
+            audioSpectrumView.setLevels(levels)
+            spectrumHandler.postDelayed(this, 70L)
+        }
+    }
+
+    // Upload & scan
+    private var currentUploadUri: Uri? = null
+
+    // Last recording (audio or screen)
+    private var lastRecordingPath: String? = null
+    private var lastRecordingLabel: String = "Last recording"
+
+    // region Activity result launchers
+
+    private val pickMediaLauncher =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+            if (result.resultCode == Activity.RESULT_OK) {
+                val dataUri = result.data?.data
+                if (dataUri != null) {
+                    currentUploadUri = dataUri
+                    val displayName = getDisplayNameFromUri(dataUri)
+                    tvFileUploadHint.text = displayName ?: "File selected"
+                    tvFileUploadHint.setTextColor(
+                        ContextCompat.getColor(this, android.R.color.white)
+                    )
+                } else {
+                    Toast.makeText(this, "No file selected", Toast.LENGTH_SHORT).show()
+                }
+            }
         }
 
-        // Placeholder for sessions – to be wired later
-        itemSessionSample?.setOnClickListener {
-            Toast.makeText(requireContext(), "Session details coming soon", Toast.LENGTH_SHORT).show()
+    private val requestAudioPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            if (granted) {
+                if (pendingStartAfterPermission) {
+                    pendingStartAfterPermission = false
+                    actuallyStartAudioMonitoring()
+                }
+            } else {
+                pendingStartAfterPermission = false
+                Toast.makeText(
+                    this,
+                    "Microphone permission is needed to listen for audio.",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
         }
+
+    private val screenCaptureLauncher =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+            if (result.resultCode == Activity.RESULT_OK && result.data != null) {
+                val dataIntent: Intent = result.data!!
+                val serviceIntent = Intent(this, ScreenRecordingService::class.java).apply {
+                    action = ScreenRecordingService.ACTION_START
+                    putExtra(ScreenRecordingService.EXTRA_RESULT_CODE, result.resultCode)
+                    putExtra(ScreenRecordingService.EXTRA_RESULT_DATA, dataIntent)
+                }
+
+                ScreenRecordingService.recordingCallback = this
+                startService(serviceIntent)
+            } else {
+                Toast.makeText(this, "Screen capture permission denied", Toast.LENGTH_SHORT).show()
+            }
+        }
+
+    // endregion
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_session)
+
+        // Attach as callback if service is running already
+        if (ScreenRecordingService.isRunning) {
+            ScreenRecordingService.recordingCallback = this
+        }
+
+        // Read sessionId if coming from elsewhere (e.g., list of sessions)
+        sessionId = intent.getStringExtra("session_id")
+            ?: intent.getStringExtra(EXTRA_SESSION_ID)
+
+        bindViews()
+        setupHeaderFromIntent()
+        setupModeFromIntent()
+        configureUiForMode(sessionMode)
+        setupListeners()
+
+        // If this is an existing session (especially website_link), load details
+        loadSessionDetailsIfAvailable()
     }
 
     override fun onResume() {
         super.onResume()
-        Log.d(TAG, "onResume → loadCopilotData()")
-        // Every time you switch to Copilot tab, reload chats
-        loadCopilotData()
+        // Update button state when returning to activity
+        if (sessionMode == SessionMode.SCREEN_RECORD) {
+            updateScreenRecordingButton()
+        }
     }
 
-    // --------------------------------------------------
-    // HIGH LEVEL LOAD
-    // --------------------------------------------------
+    // region Setup
 
-    private fun loadCopilotData() {
-        if (!isAdded) {
-            Log.w(TAG, "loadCopilotData called but fragment is not added")
-            return
-        }
+    private fun bindViews() {
+        btnBack = findViewById(R.id.btnBack)
+        tvSessionHeaderTitle = findViewById(R.id.tvSessionHeaderTitle)
+        tvSessionHeaderSubtitle = findViewById(R.id.tvSessionHeaderSubtitle)
 
-        if (!isOnline()) {
-            Toast.makeText(
-                requireContext(),
-                "You are offline. Connect to the internet to load Copilot.",
-                Toast.LENGTH_LONG
-            ).show()
-            return
-        }
+        imgSessionIcon = findViewById(R.id.imgSessionIcon)
+        tvSessionTypeTitle = findViewById(R.id.tvSessionTypeTitle)
+        tvSessionTypeBody = findViewById(R.id.tvSessionTypeBody)
 
-        showLoading(true)
-        fetchChats()
-        // Later: fetchSessions() when you have a sessions API
+        audioSpectrumView = findViewById(R.id.audioSpectrumView)
+        tvSessionTimer = findViewById(R.id.tvSessionTimer)
+
+        cardSessionType = findViewById(R.id.cardSessionType)
+        cardAiAnalysis = findViewById(R.id.cardAiAnalysis)
+        tvAiAnalysisTitle = findViewById(R.id.tvAiAnalysisTitle)
+        tvAiAnalysisBody = findViewById(R.id.tvAiAnalysisBody)
+        tvOpenAiChatLink = findViewById(R.id.tvOpenAiChatLink)
+
+        layoutFileUpload = findViewById(R.id.layoutFileUpload)
+        tvFileUploadHint = findViewById(R.id.tvFileUploadHint)
+
+        layoutWebsiteUrl = findViewById(R.id.layoutWebsiteUrl)
+        etWebsiteUrl = findViewById(R.id.etWebsiteUrl)
+
+        btnStartStop = findViewById(R.id.btnStartStop)
+
+        cardLastRecording = findViewById(R.id.cardLastRecording)
+        btnPlayLastRecording = findViewById(R.id.btnPlayLastRecording)
+        tvLastRecordingTitle = findViewById(R.id.tvLastRecordingTitle)
+        tvLastRecordingSubtitle = findViewById(R.id.tvLastRecordingSubtitle)
+
+        btnReportSession = findViewById(R.id.btnReportSession)
     }
 
-    // --------------------------------------------------
-    // FETCH CHATS: GET /api/v1/chats/get_chats
-    // --------------------------------------------------
+    private fun setupHeaderFromIntent() {
+        val title = intent.getStringExtra("session_title")
+            ?: intent.getStringExtra(EXTRA_SESSION_TITLE)
+            ?: "Listen to audio"
 
-    private fun fetchChats() {
-        val ctx = context ?: return
+        val subtitle = intent.getStringExtra("session_subtitle")
+            ?: intent.getStringExtra(EXTRA_SESSION_SUBTITLE)
+            ?: "Guard listens to live calls or surroundings for fraud signals."
 
-        Log.d(TAG, "Fetching chats from backend")
+        tvSessionHeaderTitle.text = title
+        tvSessionHeaderSubtitle.text = subtitle
+    }
 
-        val prefs = ctx.getSharedPreferences("sentricall_prefs", Context.MODE_PRIVATE)
-        val token = prefs.getString("auth_token", null)
+    private fun setupModeFromIntent() {
+        val modeId = intent.getStringExtra("session_mode")
 
-        if (token.isNullOrEmpty()) {
-            Log.w(TAG, "No auth token found in prefs")
-            showLoading(false)
-            Toast.makeText(ctx, "Session expired. Please log in again.", Toast.LENGTH_LONG).show()
-            navigateToLogin()
-            return
+        sessionMode = when (modeId) {
+            "listen_audio" -> SessionMode.LISTEN_AUDIO
+            "record_screen" -> SessionMode.SCREEN_RECORD
+            "upload_media" -> SessionMode.UPLOAD_MEDIA
+            "website_link" -> SessionMode.WEBSITE_LINK
+            else -> {
+                val legacyId = intent.getIntExtra(EXTRA_SESSION_TYPE_ID, -1)
+                when (legacyId) {
+                    1 -> SessionMode.LISTEN_AUDIO
+                    2 -> SessionMode.UPLOAD_MEDIA
+                    3 -> SessionMode.WEBSITE_LINK
+                    4 -> SessionMode.SCREEN_RECORD
+                    else -> SessionMode.LISTEN_AUDIO
+                }
+            }
         }
+    }
+
+    private fun configureUiForMode(mode: SessionMode) {
+        audioSpectrumView.visibility = View.GONE
+        tvSessionTimer.visibility = View.GONE
+        layoutFileUpload.visibility = View.GONE
+        layoutWebsiteUrl.visibility = View.GONE
+
+        when (mode) {
+            SessionMode.LISTEN_AUDIO -> {
+                imgSessionIcon.setImageResource(android.R.drawable.ic_btn_speak_now)
+                tvSessionTypeTitle.text = "Live audio monitoring"
+                tvSessionTypeBody.text =
+                    "Sentricall listens to your environment or call and raises flags for risky phrases."
+                audioSpectrumView.visibility = View.VISIBLE
+                tvSessionTimer.visibility = View.VISIBLE
+                btnStartStop.text = "Start listening"
+                audioSpectrumView.setLevels(FloatArray(48) { 0f })
+            }
+
+            SessionMode.UPLOAD_MEDIA -> {
+                imgSessionIcon.setImageResource(android.R.drawable.ic_menu_upload)
+                tvSessionTypeTitle.text = "Upload & scan"
+                tvSessionTypeBody.text =
+                    "Upload a voice note or screenshot and let Sentricall scan it for warning signs."
+                layoutFileUpload.visibility = View.VISIBLE
+                btnStartStop.text = "Scan file"
+            }
+
+            SessionMode.WEBSITE_LINK -> {
+                imgSessionIcon.setImageResource(android.R.drawable.ic_menu_view)
+                tvSessionTypeTitle.text = "Scan a website link"
+                tvSessionTypeBody.text =
+                    "Paste a website URL and Sentricall will check it for red flags."
+                layoutWebsiteUrl.visibility = View.VISIBLE
+                etWebsiteUrl.requestFocus()
+                btnStartStop.text = "Scan link"
+            }
+
+            SessionMode.SCREEN_RECORD -> {
+                imgSessionIcon.setImageResource(android.R.drawable.ic_menu_slideshow)
+                tvSessionTypeTitle.text = "Screen monitoring"
+                tvSessionTypeBody.text =
+                    "Record your screen while you interact with a site or app. Sentricall will analyse the session."
+
+                updateScreenRecordingButton()
+            }
+        }
+
+        tvAiAnalysisTitle.text = "AI analysis for this session"
+        tvAiAnalysisBody.text =
+            "Once this session runs, Sentricall will generate flags and insights here."
+        tvOpenAiChatLink.text = "Open detailed AI chat for this session"
+    }
+
+    private fun updateScreenRecordingButton() {
+        btnStartStop.text = if (ScreenRecordingService.isRunning) {
+            "Stop screen recording"
+        } else {
+            "Start screen recording"
+        }
+    }
+
+    private fun setupListeners() {
+        btnBack.setOnClickListener { finish() }
+
+        layoutFileUpload.setOnClickListener {
+            if (sessionMode == SessionMode.UPLOAD_MEDIA) {
+                openMediaPicker()
+            }
+        }
+
+        btnStartStop.setOnClickListener {
+            when (sessionMode) {
+                SessionMode.LISTEN_AUDIO -> toggleAudioMonitoring()
+                SessionMode.UPLOAD_MEDIA -> handleUploadScan()
+                SessionMode.WEBSITE_LINK -> handleWebsiteScan()
+                SessionMode.SCREEN_RECORD -> toggleScreenRecording()
+            }
+        }
+
+        btnPlayLastRecording.setOnClickListener {
+            togglePlaybackOfLastRecording()
+        }
+
+        btnReportSession.setOnClickListener {
+            showReportDialog()
+        }
+
+        // Open AI chat for this session (if we have a sessionId)
+        tvOpenAiChatLink.setOnClickListener {
+            val id = sessionId
+            if (id.isNullOrEmpty()) {
+                Toast.makeText(this, "Session chat is not available yet.", Toast.LENGTH_SHORT)
+                    .show()
+                return@setOnClickListener
+            }
+
+            val intent = Intent(this, ChatActivity::class.java).apply {
+                putExtra("session_id", id)
+                putExtra("session_name", tvSessionHeaderTitle.text.toString())
+            }
+            startActivity(intent)
+        }
+    }
+
+    // endregion
+
+    // region Session CRUD – READ (get_session)
+
+    private fun loadSessionDetailsIfAvailable() {
+        val id = sessionId ?: return
+        val token = getAuthToken(this) ?: return
 
         Thread {
-            var connection: HttpURLConnection? = null
+            var conn: HttpURLConnection? = null
             try {
-                val url = URL(AppConfig.BASE_URL + "chats/get_chats")
-                Log.d(TAG, "GET URL: $url")
-
-                connection = (url.openConnection() as HttpURLConnection).apply {
+                val url = URL(AppConfig.BASE_URL + "sessions/get_session/$id")
+                conn = (url.openConnection() as HttpURLConnection).apply {
                     requestMethod = "GET"
                     setRequestProperty("Authorization", "Bearer $token")
                     connectTimeout = 10000
                     readTimeout = 10000
                 }
 
-                val status = connection.responseCode
-                val responseBody = if (status in 200..299) {
-                    connection.inputStream.bufferedReader().use { it.readText() }
-                } else {
-                    connection.errorStream?.bufferedReader()?.use { it.readText() } ?: ""
+                val status = conn.responseCode
+                if (status !in 200..299) return@Thread
+
+                val body = conn.inputStream.bufferedReader().use { it.readText() }
+                val root = JSONObject(body)
+                val sessionObj = root.optJSONObject("session") ?: return@Thread
+
+                val name = cleanNullableString(sessionObj.optString("name", ""))
+                val type = cleanNullableString(sessionObj.optString("type", ""))
+                val websiteUrl = cleanNullableString(sessionObj.optString("websiteUrl", ""))
+                val initialSummary =
+                    cleanNullableString(sessionObj.optString("initialScanSummary", ""))
+                val initialRiskRaw =
+                    cleanNullableString(sessionObj.optString("initialScanRiskLevel", ""))
+
+                runOnUiThread {
+                    if (name.isNotBlank()) {
+                        tvSessionHeaderTitle.text = name
+                    }
+
+                    if (sessionMode == SessionMode.WEBSITE_LINK || type == "website_link") {
+                        val hasUrl = websiteUrl.isNotBlank()
+                        val hasSummary = initialSummary.isNotBlank()
+                        val riskUpper =
+                            initialRiskRaw.uppercase(Locale.getDefault())
+                        val hasMeaningfulRisk =
+                            riskUpper == "HIGH" || riskUpper == "MEDIUM" || riskUpper == "LOW"
+
+                        // Only treat as "complete" if URL, summary AND meaningful risk exist
+                        val hasFullWebsiteScan = hasUrl && hasSummary && hasMeaningfulRisk
+
+                        layoutWebsiteUrl.visibility = View.VISIBLE
+
+                        if (hasUrl) {
+                            etWebsiteUrl.setText(websiteUrl)
+                        } else {
+                            etWebsiteUrl.setText("")
+                        }
+
+                        // Always show any existing analysis if present
+                        if (hasSummary || hasMeaningfulRisk) {
+                            val baseText = if (hasSummary) {
+                                initialSummary
+                            } else {
+                                "Previous scan available."
+                            }
+
+                            val combined = if (hasMeaningfulRisk) {
+                                "$baseText\n\nRisk level: $riskUpper"
+                            } else {
+                                baseText
+                            }
+
+                            val spannable = SpannableString(combined)
+                            if (hasMeaningfulRisk) {
+                                val riskIndex = combined.indexOf("Risk level:")
+                                if (riskIndex != -1) {
+                                    val riskColor = when (riskUpper) {
+                                        "HIGH" -> Color.parseColor("#F97373")
+                                        "MEDIUM" -> Color.parseColor("#FACC15")
+                                        "LOW" -> Color.parseColor("#22C55E")
+                                        else -> Color.parseColor("#9CA3AF")
+                                    }
+                                    spannable.setSpan(
+                                        ForegroundColorSpan(riskColor),
+                                        riskIndex,
+                                        combined.length,
+                                        Spannable.SPAN_EXCLUSIVE_EXCLUSIVE
+                                    )
+                                }
+                            }
+                            tvAiAnalysisBody.text = spannable
+                        }
+
+                        if (hasFullWebsiteScan) {
+                            // Everything looks complete – lock input + disable scanning
+                            etWebsiteUrl.isEnabled = false
+                            layoutWebsiteUrl.isEnabled = false
+                            btnStartStop.isEnabled = false
+                            btnStartStop.text = "Scan complete"
+                        } else {
+                            // Missing URL / summary / risk UNKNOWN/null – allow re-scan
+                            etWebsiteUrl.isEnabled = true
+                            layoutWebsiteUrl.isEnabled = true
+                            btnStartStop.isEnabled = true
+                            btnStartStop.text = "Scan link"
+                        }
+                    }
+                }
+            } catch (_: Exception) {
+                // ignore – UI falls back to intent values
+            } finally {
+                conn?.disconnect()
+            }
+        }.start()
+    }
+
+    private fun getAuthToken(ctx: Context): String? {
+        val prefs = ctx.getSharedPreferences("sentricall_prefs", Context.MODE_PRIVATE)
+        return prefs.getString("auth_token", null)
+    }
+
+    // endregion
+
+    // region Upload & scan
+
+    private fun openMediaPicker() {
+        val intent = Intent(Intent.ACTION_GET_CONTENT).apply {
+            type = "*/*"
+            putExtra(
+                Intent.EXTRA_MIME_TYPES,
+                arrayOf(
+                    "image/png",
+                    "image/jpg",
+                    "image/jpeg",
+                    "image/webp",
+                    "audio/mpeg",
+                    "audio/mp3",
+                    "audio/x-m4a",
+                    "audio/mp4",
+                    "audio/wav",
+                    "audio/ogg"
+                )
+            )
+        }
+        pickMediaLauncher.launch(Intent.createChooser(intent, "Select audio or image"))
+    }
+
+    private fun handleUploadScan() {
+        if (currentUploadUri == null) {
+            Toast.makeText(this, "Please pick an audio or image file first", Toast.LENGTH_SHORT)
+                .show()
+            return
+        }
+        Toast.makeText(this, "Scanning file… (AI coming later)", Toast.LENGTH_SHORT).show()
+    }
+
+    // endregion
+
+    // region Website link
+
+    private fun handleWebsiteScan() {
+        val raw = etWebsiteUrl.text?.toString()?.trim().orEmpty()
+        if (raw.isEmpty()) {
+            layoutWebsiteUrl.error = "Please paste a website link"
+            return
+        }
+        layoutWebsiteUrl.error = null
+
+        val normalizedUrl =
+            if (!raw.startsWith("http://") && !raw.startsWith("https://")) {
+                "https://$raw"
+            } else {
+                raw
+            }
+        etWebsiteUrl.setText(normalizedUrl)
+
+        val token = getAuthToken(this)
+        if (token.isNullOrEmpty()) {
+            forceLogout("Session expired. Please log in again.")
+            return
+        }
+
+        ensureWebsiteSessionThenScan(normalizedUrl, token)
+    }
+
+    private fun ensureWebsiteSessionThenScan(websiteUrl: String, token: String) {
+        val existingId = sessionId
+        if (!existingId.isNullOrEmpty()) {
+            scanWebsiteViaBackend(existingId, websiteUrl, token)
+            return
+        }
+
+        val previousButtonText = btnStartStop.text.toString()
+        btnStartStop.isEnabled = false
+        btnStartStop.text = "Preparing…"
+        tvAiAnalysisBody.text = "Creating a Guard session before scanning this website…"
+
+        Thread {
+            var conn: HttpURLConnection? = null
+            try {
+                val apiUrl = AppConfig.BASE_URL + "sessions/create_session"
+                conn = (URL(apiUrl).openConnection() as HttpURLConnection).apply {
+                    requestMethod = "POST"
+                    setRequestProperty("Content-Type", "application/json")
+                    setRequestProperty("Authorization", "Bearer $token")
+                    doOutput = true
+                    connectTimeout = 15000
+                    readTimeout = 15000
                 }
 
-                Log.d(TAG, "GET /get_chats status=$status body=$responseBody")
+                val name = tvSessionHeaderTitle.text?.toString()
+                    ?.ifBlank { "Website session" } ?: "Website session"
 
-                activity?.runOnUiThread {
-                    showLoading(false)
+                val payload = JSONObject().apply {
+                    put("name", name)
+                    put("type", "website_link")
+                }
 
-                    if (status in 200..299) {
-                        renderChats(responseBody)
-                    } else {
-                        if (status == 401 || status == 403) {
-                            forceLogout("Session expired. Please log in again.")
+                conn.outputStream.use { os ->
+                    val bytes = payload.toString().toByteArray(Charsets.UTF_8)
+                    os.write(bytes, 0, bytes.size)
+                }
+
+                val status = conn.responseCode
+                val body = if (status in 200..299) {
+                    conn.inputStream.bufferedReader().use { it.readText() }
+                } else {
+                    conn.errorStream?.bufferedReader()?.use { it.readText() } ?: ""
+                }
+
+                if (status !in 200..299) {
+                    runOnUiThread {
+                        btnStartStop.isEnabled = true
+                        btnStartStop.text = previousButtonText
+                        tvAiAnalysisBody.text =
+                            "Error creating Guard session (HTTP $status). Please try again."
+                        Toast.makeText(
+                            this,
+                            "Error creating session: HTTP $status",
+                            Toast.LENGTH_LONG
+                        ).show()
+                    }
+                    return@Thread
+                }
+
+                val root = JSONObject(body)
+                val sessionObj = root.optJSONObject("session")
+                val newId =
+                    sessionObj?.optString("_id")?.takeIf { it.isNotBlank() }
+                        ?: sessionObj?.optString("id")?.takeIf { it.isNotBlank() }
+
+                if (newId.isNullOrEmpty()) {
+                    runOnUiThread {
+                        btnStartStop.isEnabled = true
+                        btnStartStop.text = previousButtonText
+                        tvAiAnalysisBody.text =
+                            "Error creating Guard session. Please try again."
+                        Toast.makeText(
+                            this,
+                            "Session is not initialised properly.",
+                            Toast.LENGTH_LONG
+                        ).show()
+                    }
+                    return@Thread
+                }
+
+                sessionId = newId
+
+                runOnUiThread {
+                    btnStartStop.isEnabled = true
+                    btnStartStop.text = previousButtonText
+                    scanWebsiteViaBackend(newId, websiteUrl, token)
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+                runOnUiThread {
+                    btnStartStop.isEnabled = true
+                    btnStartStop.text = previousButtonText
+                    tvAiAnalysisBody.text =
+                        "Network error while creating session. Please check your connection."
+                    Toast.makeText(
+                        this,
+                        "Network error: ${e.localizedMessage ?: "check your connection"}",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+            } finally {
+                conn?.disconnect()
+            }
+        }.start()
+    }
+
+    private fun scanWebsiteViaBackend(sessionId: String, websiteUrl: String, token: String) {
+        val previousButtonText = btnStartStop.text.toString()
+        btnStartStop.isEnabled = false
+        btnStartStop.text = "Scanning…"
+        tvAiAnalysisBody.text = "Scanning website link with AI…"
+
+        Thread {
+            var conn: HttpURLConnection? = null
+            try {
+                val apiUrl = AppConfig.BASE_URL + "sessions/scan_website/$sessionId"
+                conn = (URL(apiUrl).openConnection() as HttpURLConnection).apply {
+                    requestMethod = "POST"
+                    setRequestProperty("Content-Type", "application/json")
+                    setRequestProperty("Authorization", "Bearer $token")
+                    doOutput = true
+                    connectTimeout = 15000
+                    readTimeout = 15000
+                }
+
+                val payload = JSONObject().apply {
+                    put("websiteUrl", websiteUrl)
+                }
+
+                conn.outputStream.use { os ->
+                    val bytes = payload.toString().toByteArray(Charsets.UTF_8)
+                    os.write(bytes, 0, bytes.size)
+                }
+
+                val status = conn.responseCode
+                val body = if (status in 200..299) {
+                    conn.inputStream.bufferedReader().use { it.readText() }
+                } else {
+                    conn.errorStream?.bufferedReader()?.use { it.readText() } ?: ""
+                }
+
+                runOnUiThread {
+                    btnStartStop.isEnabled = true
+                    btnStartStop.text = previousButtonText
+
+                    if (status !in 200..299) {
+                        tvAiAnalysisBody.text =
+                            "Error scanning website (HTTP $status). Please try again."
+                        Toast.makeText(
+                            this,
+                            "Error scanning website (HTTP $status)",
+                            Toast.LENGTH_LONG
+                        ).show()
+                        return@runOnUiThread
+                    }
+
+                    try {
+                        val root = JSONObject(body)
+                        val ok = root.optBoolean("ok", false)
+                        if (!ok) {
+                            tvAiAnalysisBody.text =
+                                "Error scanning website. Please try again."
+                            Toast.makeText(
+                                this,
+                                "Scan failed: ${root.optString("message", "Unknown error")}",
+                                Toast.LENGTH_LONG
+                            ).show()
                             return@runOnUiThread
                         }
+
+                        val summaryRaw = root.optString("summary", "")
+                        val riskLevelRaw = root.optString("riskLevel", "")
+                        val sessionObj = root.optJSONObject("session")
+
+                        val serverUrl = cleanNullableString(
+                            sessionObj?.optString("websiteUrl", websiteUrl) ?: websiteUrl
+                        )
+
+                        layoutWebsiteUrl.visibility = View.VISIBLE
+                        if (serverUrl.isNotBlank()) {
+                            etWebsiteUrl.setText(serverUrl)
+                            etWebsiteUrl.isEnabled = false
+                            layoutWebsiteUrl.isEnabled = false
+                        }
+
+                        val summary = cleanNullableString(summaryRaw)
+                        val riskClean = cleanNullableString(riskLevelRaw)
+                        val riskUpper = riskClean.uppercase(Locale.getDefault())
+                        val hasMeaningfulRisk =
+                            riskUpper == "HIGH" || riskUpper == "MEDIUM" || riskUpper == "LOW"
+
+                        val combined = when {
+                            summary.isNotBlank() && hasMeaningfulRisk ->
+                                "$summary\n\nRisk level: $riskUpper"
+                            summary.isNotBlank() -> summary
+                            hasMeaningfulRisk -> "Risk level: $riskUpper"
+                            else -> "Scan complete. No specific risk rating returned."
+                        }
+
+                        val spannable = SpannableString(combined)
+                        if (hasMeaningfulRisk) {
+                            val riskIndex = combined.indexOf("Risk level:")
+                            if (riskIndex != -1) {
+                                val riskColor = when (riskUpper) {
+                                    "HIGH" -> Color.parseColor("#F97373")
+                                    "MEDIUM" -> Color.parseColor("#FACC15")
+                                    "LOW" -> Color.parseColor("#22C55E")
+                                    else -> Color.parseColor("#9CA3AF")
+                                }
+                                spannable.setSpan(
+                                    ForegroundColorSpan(riskColor),
+                                    riskIndex,
+                                    combined.length,
+                                    Spannable.SPAN_EXCLUSIVE_EXCLUSIVE
+                                )
+                            }
+                        }
+
+                        tvAiAnalysisBody.text = spannable
+
+                        // After a fresh successful scan, we treat it as complete
+                        btnStartStop.isEnabled = false
+                        btnStartStop.text = "Scan complete"
+
                         Toast.makeText(
-                            ctx,
-                            "Error loading chats ($status)",
+                            this,
+                            "Website scan complete.",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    } catch (e: Exception) {
+                        tvAiAnalysisBody.text =
+                            "Error parsing scan result. Please try again."
+                        Toast.makeText(
+                            this,
+                            "Error parsing scan result: ${e.localizedMessage}",
                             Toast.LENGTH_LONG
                         ).show()
                     }
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "Error fetching chats", e)
-                activity?.runOnUiThread {
-                    showLoading(false)
+                e.printStackTrace()
+                runOnUiThread {
+                    btnStartStop.isEnabled = true
+                    btnStartStop.text = previousButtonText
+                    tvAiAnalysisBody.text =
+                        "Network error while scanning website. Please check your connection."
                     Toast.makeText(
-                        ctx,
-                        "Network error loading chats: ${e.localizedMessage ?: "check your connection"}",
+                        this,
+                        "Network error: ${e.localizedMessage ?: "check your connection"}",
                         Toast.LENGTH_LONG
                     ).show()
                 }
             } finally {
-                connection?.disconnect()
+                conn?.disconnect()
             }
         }.start()
     }
 
-    private fun renderChats(responseBody: String) {
-        val ctx = context ?: return
-        val chatsContainer = containerChats ?: return
+    // endregion
 
-        Log.d(TAG, "Rendering chats UI")
+    // region Audio monitoring (ORIGINAL)
 
-        chatsContainer.removeAllViews()
-
-        try {
-            val root = JSONObject(responseBody)
-            val chatsArray: JSONArray = root.optJSONArray("chats") ?: JSONArray()
-
-            if (chatsArray.length() == 0) {
-                val emptyView = TextView(ctx).apply {
-                    text = "No AI chats yet. Start your first investigation above."
-                    setTextColor(ContextCompat.getColor(ctx, R.color.guard_subtle))
-                    textSize = 13f
-                }
-                chatsContainer.addView(emptyView)
-                return
-            }
-
-            for (i in 0 until chatsArray.length()) {
-                val obj = chatsArray.optJSONObject(i) ?: continue
-                val chatId = obj.optString("_id", "")
-                val name = obj.optString("name", "").ifBlank { "Untitled chat" }
-
-                if (chatId.isBlank()) continue
-
-                val item = buildChatItemView(chatId, name)
-                chatsContainer.addView(item)
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error parsing chats JSON", e)
-            Toast.makeText(ctx, "Error parsing chats", Toast.LENGTH_LONG).show()
+    private fun toggleAudioMonitoring() {
+        if (isListening) {
+            stopAudioMonitoring()
+        } else {
+            startAudioMonitoring()
         }
     }
 
-    // --------------------------------------------------
-    // NEW CHAT: custom dialog + POST /create_chat
-    // --------------------------------------------------
+    private fun startAudioMonitoring() {
+        val hasPermission = ContextCompat.checkSelfPermission(
+            this,
+            Manifest.permission.RECORD_AUDIO
+        ) == PackageManager.PERMISSION_GRANTED
 
-    private fun showNewChatDialog() {
-        if (!isAdded) return
-        val ctx = requireContext()
-        val inflater = layoutInflater
+        if (!hasPermission) {
+            pendingStartAfterPermission = true
+            requestAudioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+            return
+        }
 
-        // Uses dialog_new_chat.xml
-        val dialogView = inflater.inflate(R.layout.dialog_new_chat, null)
+        actuallyStartAudioMonitoring()
+    }
 
-        val tilChatName = dialogView.findViewById<TextInputLayout>(R.id.tilChatName)
-        val etChatName = dialogView.findViewById<TextInputEditText>(R.id.etChatName)
-        val btnCancel = dialogView.findViewById<Button>(R.id.btnCancel)
-        val btnCreate = dialogView.findViewById<Button>(R.id.btnCreate)
+    private fun actuallyStartAudioMonitoring() {
+        try {
+            stopPlaybackInternal()
 
-        val dialog = AlertDialog.Builder(ctx)
+            val dir = File(getExternalFilesDir(Environment.DIRECTORY_MUSIC), "audio_sessions")
+            if (!dir.exists()) dir.mkdirs()
+
+            val dateStr =
+                SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
+            val file = File(dir, "sentricall_audio_$dateStr.m4a")
+            audioOutputPath = file.absolutePath
+
+            mediaRecorder = MediaRecorder().apply {
+                setAudioSource(MediaRecorder.AudioSource.MIC)
+                setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+                setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+                setAudioEncodingBitRate(128_000)
+                setAudioSamplingRate(44_100)
+                setOutputFile(audioOutputPath)
+                prepare()
+                start()
+            }
+
+            isListening = true
+            audioStartTime = System.currentTimeMillis()
+            lastRecordingDurationSec = 0
+            tvSessionTimer.text = "00:00"
+            tvSessionTimer.visibility = View.VISIBLE
+
+            lastNormLevel = 0f
+            audioSpectrumView.visibility = View.VISIBLE
+            audioSpectrumView.setLevels(FloatArray(48) { 0f })
+
+            btnStartStop.text = "Stop listening"
+            timerHandler.post(timerRunnable)
+            spectrumHandler.post(spectrumRunnable)
+
+        } catch (e: Exception) {
+            e.printStackTrace()
+            Toast.makeText(this, "Error starting audio: ${e.message}", Toast.LENGTH_SHORT).show()
+            isListening = false
+            btnStartStop.text = "Start listening"
+            timerHandler.removeCallbacks(timerRunnable)
+            spectrumHandler.removeCallbacks(spectrumRunnable)
+            audioSpectrumView.setLevels(FloatArray(48) { 0f })
+        }
+    }
+
+    private fun stopAudioMonitoring() {
+        try {
+            isListening = false
+            timerHandler.removeCallbacks(timerRunnable)
+            spectrumHandler.removeCallbacks(spectrumRunnable)
+
+            mediaRecorder?.apply {
+                try {
+                    stop()
+                } catch (_: Exception) {
+                }
+                reset()
+                release()
+            }
+            mediaRecorder = null
+
+            btnStartStop.text = "Start listening"
+            audioSpectrumView.setLevels(FloatArray(48) { 0f })
+
+            audioOutputPath?.let { path ->
+                lastRecordingPath = path
+                lastRecordingLabel = "Last audio session"
+                cardLastRecording.visibility = View.VISIBLE
+                tvLastRecordingTitle.text = lastRecordingLabel
+                tvLastRecordingSubtitle.text =
+                    formatDurationLabel(lastRecordingDurationSec, playing = false)
+            }
+
+        } catch (e: Exception) {
+            e.printStackTrace()
+            Toast.makeText(this, "Error stopping audio: ${e.message}", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    // endregion
+
+    // region Screen recording (ORIGINAL)
+
+    private fun toggleScreenRecording() {
+        if (ScreenRecordingService.isRunning) {
+            // Stop the running recording (no permission dialog here)
+            stopScreenRecording()
+        } else {
+            // Start a new recording (will show "Share your screen" dialog)
+            startScreenRecording()
+        }
+    }
+
+    private fun startScreenRecording() {
+        requestScreenCapture()
+    }
+
+    private fun stopScreenRecording() {
+        val stopIntent = Intent(this, ScreenRecordingService::class.java).apply {
+            action = ScreenRecordingService.ACTION_STOP
+        }
+        startService(stopIntent)
+    }
+
+    private fun requestScreenCapture() {
+        val mgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE)
+                as android.media.projection.MediaProjectionManager
+        val intent = mgr.createScreenCaptureIntent()
+        screenCaptureLauncher.launch(intent)
+    }
+
+    override fun onRecordingStarted() {
+        runOnUiThread {
+            btnStartStop.text = "Stop screen recording"
+            Toast.makeText(this, "Screen recording started", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    override fun onRecordingStopped(filePath: String?) {
+        runOnUiThread {
+            ScreenRecordingService.recordingCallback = null
+            btnStartStop.text = "Start screen recording"
+
+            if (filePath != null) {
+                lastRecordingPath = filePath
+                lastRecordingLabel = "Last screen recording"
+                cardLastRecording.visibility = View.VISIBLE
+                tvLastRecordingTitle.text = lastRecordingLabel
+                tvLastRecordingSubtitle.text = "Tap to play recording"
+                Toast.makeText(this, "Screen recording saved", Toast.LENGTH_SHORT).show()
+            } else {
+                Toast.makeText(
+                    this,
+                    "Screen recording stopped, but no file was saved.",
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
+        }
+    }
+
+    override fun onRecordingError(error: String) {
+        runOnUiThread {
+            ScreenRecordingService.recordingCallback = null
+            btnStartStop.text = "Start screen recording"
+            Toast.makeText(this, "Screen recording error: $error", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    // endregion
+
+    // region Playback for last recording (ORIGINAL)
+
+    private fun togglePlaybackOfLastRecording() {
+        val path = lastRecordingPath
+        if (path.isNullOrEmpty()) {
+            Toast.makeText(this, "No recording found", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        if (lastRecordingLabel == "Last screen recording") {
+            openScreenRecording(path)
+            return
+        }
+
+        // AUDIO playback
+        if (!isPlayingRecording) {
+            try {
+                stopPlaybackInternal()
+                playbackPlayer = MediaPlayer().apply {
+                    setDataSource(path)
+                    setOnCompletionListener {
+                        stopPlaybackInternal()
+                    }
+                    setOnPreparedListener {
+                        start()
+                    }
+                    setOnErrorListener { _, _, _ ->
+                        stopPlaybackInternal()
+                        true
+                    }
+                    prepare()
+                }
+                isPlayingRecording = true
+                btnPlayLastRecording.setImageResource(android.R.drawable.ic_media_pause)
+                tvLastRecordingSubtitle.text =
+                    formatDurationLabel(lastRecordingDurationSec, playing = true)
+            } catch (e: Exception) {
+                e.printStackTrace()
+                Toast.makeText(this, "Error playing audio: ${e.message}", Toast.LENGTH_SHORT)
+                    .show()
+                stopPlaybackInternal()
+            }
+        } else {
+            stopPlaybackInternal()
+        }
+    }
+
+    // show screen recording inside a modal dialog with VideoView
+    private fun openScreenRecording(path: String) {
+        try {
+            val file = File(path)
+            if (!file.exists()) {
+                Toast.makeText(this, "Recording file not found", Toast.LENGTH_SHORT).show()
+                return
+            }
+
+            val uri = FileProvider.getUriForFile(
+                this,
+                "${packageName}.fileprovider",
+                file
+            )
+
+            val videoView = VideoView(this).apply {
+                setVideoURI(uri)
+                setOnPreparedListener { mp ->
+                    mp.isLooping = true
+                    start()
+                }
+                setOnErrorListener { _, what, extra ->
+                    Toast.makeText(
+                        context,
+                        "Error playing video ($what, $extra)",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                    stopPlayback()
+                    true
+                }
+            }
+
+            val dialog = AlertDialog.Builder(this)
+                .setView(videoView)
+                .setCancelable(true)
+                .setPositiveButton("Close") { d, _ ->
+                    videoView.stopPlayback()
+                    d.dismiss()
+                }
+                .create()
+
+            dialog.setOnShowListener {
+                videoView.start()
+            }
+
+            dialog.setOnDismissListener {
+                videoView.stopPlayback()
+            }
+
+            dialog.show()
+
+        } catch (e: Exception) {
+            e.printStackTrace()
+            Toast.makeText(
+                this,
+                "Error opening recording: ${e.message}",
+                Toast.LENGTH_SHORT
+            ).show()
+        }
+    }
+
+    private fun stopPlaybackInternal() {
+        try {
+            playbackPlayer?.stop()
+        } catch (_: Exception) {
+        }
+        playbackPlayer?.release()
+        playbackPlayer = null
+
+        if (isPlayingRecording) {
+            isPlayingRecording = false
+            btnPlayLastRecording.setImageResource(android.R.drawable.ic_media_play)
+            if (lastRecordingLabel != "Last screen recording") {
+                tvLastRecordingSubtitle.text =
+                    formatDurationLabel(lastRecordingDurationSec, playing = false)
+            }
+        }
+    }
+
+    private fun formatDurationLabel(seconds: Int, playing: Boolean): String {
+        val mins = seconds / 60
+        val secs = seconds % 60
+        val base = String.format("%02d:%02d", mins, secs)
+        return if (playing) "$base • Playing…" else "$base • Tap to play"
+    }
+
+    // endregion
+
+    // region Report dialog (ORIGINAL)
+
+    private fun showReportDialog() {
+        val dialogView = layoutInflater.inflate(R.layout.dialog_report_session, null)
+
+        val etTitle = dialogView.findViewById<EditText>(R.id.etReportTitle)
+        val etName = dialogView.findViewById<EditText>(R.id.etReportName)
+        val etPhone = dialogView.findViewById<EditText>(R.id.etReportPhone)
+        val etDetails = dialogView.findViewById<EditText>(R.id.etReportDetails)
+        val cbMarkSuspicious = dialogView.findViewById<CheckBox>(R.id.cbMarkSuspicious)
+        val btnCancel = dialogView.findViewById<MaterialButton>(R.id.btnCancelReport)
+        val btnSubmit = dialogView.findViewById<MaterialButton>(R.id.btnSubmitReport)
+
+        val alertDialog = AlertDialog.Builder(this)
             .setView(dialogView)
             .setCancelable(true)
             .create()
 
         btnCancel.setOnClickListener {
-            dialog.dismiss()
+            alertDialog.dismiss()
         }
 
-        btnCreate.setOnClickListener {
-            val name = etChatName.text?.toString()?.trim().orEmpty()
-            if (name.isEmpty()) {
-                tilChatName.error = "Chat name is required"
-            } else {
-                tilChatName.error = null
-                dialog.dismiss()
-                createChat(name)
-            }
-        }
+        btnSubmit.setOnClickListener {
+            val title = etTitle.text.toString().trim()
+            val name = etName.text.toString().trim()
+            val phone = etPhone.text.toString().trim()
+            val details = etDetails.text.toString().trim()
+            val markSuspicious = cbMarkSuspicious.isChecked
 
-        dialog.window?.setBackgroundDrawableResource(android.R.color.transparent)
-        dialog.show()
-    }
-
-    private fun createChat(name: String) {
-        val ctx = context ?: return
-
-        if (!isOnline()) {
-            Toast.makeText(ctx, "No internet connection", Toast.LENGTH_SHORT).show()
-            return
-        }
-
-        val prefs = ctx.getSharedPreferences("sentricall_prefs", Context.MODE_PRIVATE)
-        val token = prefs.getString("auth_token", null)
-
-        if (token.isNullOrEmpty()) {
-            Toast.makeText(ctx, "Session expired. Please log in again.", Toast.LENGTH_LONG).show()
-            navigateToLogin()
-            return
-        }
-
-        showLoading(true)
-
-        Thread {
-            var connection: HttpURLConnection? = null
-            try {
-                val url = URL(AppConfig.BASE_URL + "chats/create_chat")
-                Log.d(TAG, "POST URL: $url")
-
-                connection = (url.openConnection() as HttpURLConnection).apply {
-                    requestMethod = "POST"
-                    setRequestProperty("Content-Type", "application/json")
-                    setRequestProperty("Authorization", "Bearer $token")
-                    doOutput = true
-                    connectTimeout = 10000
-                    readTimeout = 10000
-                }
-
-                val payload = JSONObject().apply {
-                    put("name", name)
-                }
-
-                connection.outputStream.use { os ->
-                    val bytes = payload.toString().toByteArray(Charsets.UTF_8)
-                    os.write(bytes, 0, bytes.size)
-                }
-
-                val status = connection.responseCode
-                val responseBody = if (status in 200..299) {
-                    connection.inputStream.bufferedReader().use { it.readText() }
-                } else {
-                    connection.errorStream?.bufferedReader()?.use { it.readText() } ?: ""
-                }
-
-                Log.d(TAG, "POST /create_chat status=$status body=$responseBody")
-
-                activity?.runOnUiThread {
-                    showLoading(false)
-
-                    if (status in 200..299) {
-                        try {
-                            val root = JSONObject(responseBody)
-                            val chatObj = root.optJSONObject("chat")
-
-                            // Safely derive chatId and chatName
-                            val chatId = chatObj?.optString("_id", "") ?: ""
-                            val rawName = chatObj?.optString("name", name)
-                            val chatName = if (rawName.isNullOrBlank()) name else rawName
-
-                            if (chatId.isNotBlank()) {
-                                // ✅ Go straight to ChatActivity
-                                val intent = Intent(ctx, ChatActivity::class.java).apply {
-                                    putExtra("chat_id", chatId)
-                                    putExtra("chat_name", chatName)
-                                }
-                                startActivity(intent)
-                            } else {
-                                // Fallback: just show success & refresh list
-                                Toast.makeText(ctx, "Chat created successfully", Toast.LENGTH_SHORT).show()
-                                loadCopilotData()
-                            }
-                        } catch (e: Exception) {
-                            Log.e(TAG, "Error parsing create_chat response", e)
-                            Toast.makeText(ctx, "Chat created. Reloading list…", Toast.LENGTH_SHORT).show()
-                            loadCopilotData()
-                        }
-                    } else {
-                        if (status == 401 || status == 403) {
-                            forceLogout("Session expired. Please log in again.")
-                            return@runOnUiThread
-                        }
-                        val msg = try {
-                            JSONObject(responseBody).optString("message", "Error creating chat")
-                        } catch (_: Exception) {
-                            "Error creating chat ($status)"
-                        }
-                        Toast.makeText(ctx, msg, Toast.LENGTH_LONG).show()
-                    }
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "Network error creating chat", e)
-                activity?.runOnUiThread {
-                    showLoading(false)
-                    Toast.makeText(
-                        ctx,
-                        "Network error creating chat: ${e.localizedMessage ?: "check your connection"}",
-                        Toast.LENGTH_LONG
-                    ).show()
-                }
-            } finally {
-                connection?.disconnect()
-            }
-        }.start()
-    }
-
-    // --------------------------------------------------
-    // DELETE CHAT: DELETE /api/v1/chats/delete_chat/:chatId
-    // --------------------------------------------------
-
-    private fun confirmDeleteChat(chatId: String, viewToRemove: View) {
-        if (!isAdded) return
-        val ctx = requireContext()
-        AlertDialog.Builder(ctx)
-            .setTitle("Delete chat")
-            .setMessage("Are you sure you want to delete this chat?")
-            .setNegativeButton("Cancel", null)
-            .setPositiveButton("Delete") { _, _ ->
-                deleteChat(chatId, viewToRemove)
-            }
-            .show()
-    }
-
-    private fun deleteChat(chatId: String, viewToRemove: View) {
-        val ctx = context ?: return
-
-        if (!isOnline()) {
-            Toast.makeText(ctx, "No internet connection", Toast.LENGTH_SHORT).show()
-            return
-        }
-
-        val prefs = ctx.getSharedPreferences("sentricall_prefs", Context.MODE_PRIVATE)
-        val token = prefs.getString("auth_token", null)
-
-        if (token.isNullOrEmpty()) {
-            Toast.makeText(ctx, "Session expired. Please log in again.", Toast.LENGTH_LONG).show()
-            navigateToLogin()
-            return
-        }
-
-        showLoading(true)
-
-        Thread {
-            var connection: HttpURLConnection? = null
-            try {
-                val url = URL(AppConfig.BASE_URL + "chats/delete_chat/$chatId")
-                Log.d(TAG, "DELETE URL: $url")
-
-                connection = (url.openConnection() as HttpURLConnection).apply {
-                    requestMethod = "DELETE"
-                    setRequestProperty("Authorization", "Bearer $token")
-                    connectTimeout = 10000
-                    readTimeout = 10000
-                }
-
-                val status = connection.responseCode
-                val responseBody = if (status in 200..299) {
-                    connection.inputStream.bufferedReader().use { it.readText() }
-                } else {
-                    connection.errorStream?.bufferedReader()?.use { it.readText() } ?: ""
-                }
-
-                Log.d(TAG, "DELETE /delete_chat status=$status body=$responseBody")
-
-                activity?.runOnUiThread {
-                    showLoading(false)
-
-                    val chatsContainer = containerChats ?: return@runOnUiThread
-
-                    if (status in 200..299) {
-                        chatsContainer.removeView(viewToRemove)
-                        Toast.makeText(ctx, "Chat deleted", Toast.LENGTH_SHORT).show()
-
-                        if (chatsContainer.childCount == 0) {
-                            val emptyView = TextView(ctx).apply {
-                                text = "No AI chats yet. Start your first investigation above."
-                                setTextColor(ContextCompat.getColor(ctx, R.color.guard_subtle))
-                                textSize = 13f
-                            }
-                            chatsContainer.addView(emptyView)
-                        }
-                    } else {
-                        if (status == 401 || status == 403) {
-                            forceLogout("Session expired. Please log in again.")
-                            return@runOnUiThread
-                        }
-                        val msg = try {
-                            JSONObject(responseBody).optString("message", "Error deleting chat")
-                        } catch (_: Exception) {
-                            "Error deleting chat ($status)"
-                        }
-                        Toast.makeText(ctx, msg, Toast.LENGTH_LONG).show()
-                    }
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "Network error deleting chat", e)
-                activity?.runOnUiThread {
-                    showLoading(false)
-                    Toast.makeText(
-                        ctx,
-                        "Network error deleting chat: ${e.localizedMessage ?: "check your connection"}",
-                        Toast.LENGTH_LONG
-                    ).show()
-                }
-            } finally {
-                connection?.disconnect()
-            }
-        }.start()
-    }
-
-    // --------------------------------------------------
-    // BUILD CHAT ITEM VIEW (matches your design)
-    // --------------------------------------------------
-
-    private fun buildChatItemView(chatId: String, name: String): View {
-        val ctx = requireContext()
-
-        val itemLayout = LinearLayout(ctx).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.parseColor("#111827"))
-            isClickable = true
-            isFocusable = true
-            val lp = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            )
-            lp.bottomMargin = dp(8)
-            layoutParams = lp
-            setPadding(dp(12), dp(12), dp(12), dp(12))
-        }
-
-        val headerRow = LinearLayout(ctx).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-
-        val tvTitle = TextView(ctx).apply {
-            text = name
-            setTextColor(ContextCompat.getColor(ctx, R.color.guard_text))
-            textSize = 14f
-            setTypeface(typeface, android.graphics.Typeface.BOLD)
-            maxLines = 1
-            ellipsize = TextUtils.TruncateAt.END
-            layoutParams = LinearLayout.LayoutParams(
-                0,
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                1f
-            )
-        }
-
-        val btnDelete = android.widget.ImageButton(ctx).apply {
-            setImageResource(android.R.drawable.ic_menu_delete)
-            background = null
-            imageTintList = ContextCompat.getColorStateList(ctx, android.R.color.holo_red_light)
-            val lp = LinearLayout.LayoutParams(dp(32), dp(32))
-            layoutParams = lp
-            contentDescription = "Delete chat"
-        }
-
-        headerRow.addView(tvTitle)
-        headerRow.addView(btnDelete)
-
-        val tvSubtitle = TextView(ctx).apply {
-            text = "Tap to continue your AI investigation."
-            setTextColor(ContextCompat.getColor(ctx, R.color.guard_subtle))
-            textSize = 12f
-            setPadding(0, dp(2), 0, 0)
-        }
-
-        itemLayout.addView(headerRow)
-        itemLayout.addView(tvSubtitle)
-
-        // Open ChatActivity with this chat
-        itemLayout.setOnClickListener {
-            if (!isOnline()) {
-                Toast.makeText(ctx, "No internet connection", Toast.LENGTH_SHORT).show()
+            if (title.isEmpty() && details.isEmpty()) {
+                Toast.makeText(this, "Please add a subject or some details", Toast.LENGTH_SHORT)
+                    .show()
                 return@setOnClickListener
             }
-            val intent = Intent(ctx, ChatActivity::class.java).apply {
-                putExtra("chat_id", chatId)
-                putExtra("chat_name", name)
-            }
-            startActivity(intent)
+
+            // TODO: send to backend (including sessionId & markSuspicious if needed)
+            Toast.makeText(this, "Thanks, your report has been captured.", Toast.LENGTH_SHORT)
+                .show()
+            alertDialog.dismiss()
         }
 
-        btnDelete.setOnClickListener {
-            if (!isOnline()) {
-                Toast.makeText(ctx, "No internet connection", Toast.LENGTH_SHORT).show()
-                return@setOnClickListener
-            }
-            confirmDeleteChat(chatId, itemLayout)
+        alertDialog.show()
+    }
+
+    // endregion
+
+    // region Helpers & lifecycle
+
+    private fun getDisplayNameFromUri(uri: Uri): String? {
+        return contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+            val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+            if (nameIndex != -1 && cursor.moveToFirst()) {
+                cursor.getString(nameIndex)
+            } else null
         }
-
-        return itemLayout
     }
 
-    private fun dp(value: Int): Int {
-        val metrics = resources.displayMetrics
-        return (value * metrics.density).toInt()
-    }
-
-    // --------------------------------------------------
-    // CONNECTIVITY + AUTH HELPERS
-    // --------------------------------------------------
-
-    private fun isOnline(): Boolean {
-        val ctx = context ?: return false
-        val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager?
-
-        if (cm != null) {
-            return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                try {
-                    val nw = cm.activeNetwork ?: return false
-                    val actNw = cm.getNetworkCapabilities(nw) ?: return false
-                    actNw.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-                } catch (e: SecurityException) {
-                    Log.e(TAG, "Missing ACCESS_NETWORK_STATE permission", e)
-                    false
-                }
-            } else {
-                @Suppress("DEPRECATION")
-                val nwInfo = cm.activeNetworkInfo ?: return false
-                @Suppress("DEPRECATION")
-                nwInfo.isConnected
-            }
+    /**
+     * Clean up strings coming from the backend so we never show
+     * "null" / "NULL" / "unknown" / "UNKNOWN" in the UI.
+     */
+    private fun cleanNullableString(value: String?): String {
+        if (value == null) return ""
+        val trimmed = value.trim()
+        return if (
+            trimmed.equals("null", ignoreCase = true) ||
+            trimmed.equals("unknown", ignoreCase = true)
+        ) {
+            ""
+        } else {
+            trimmed
         }
-        return false
-    }
-
-    private fun showLoading(show: Boolean) {
-        progressLoading?.visibility = if (show) View.VISIBLE else View.GONE
     }
 
     private fun forceLogout(message: String? = null) {
-        val ctx = context ?: return
-        val prefs = ctx.getSharedPreferences("sentricall_prefs", Context.MODE_PRIVATE)
+        val prefs = getSharedPreferences("sentricall_prefs", Context.MODE_PRIVATE)
         prefs.edit().clear().apply()
         if (!message.isNullOrEmpty()) {
-            Toast.makeText(ctx, message, Toast.LENGTH_LONG).show()
+            Toast.makeText(this, message, Toast.LENGTH_LONG).show()
         }
-        navigateToLogin()
-    }
-
-    private fun navigateToLogin() {
-        if (!isAdded) return
-        val ctx = requireContext()
-        val intent = Intent(ctx, LoginActivity::class.java).apply {
+        val intent = Intent(this, LoginActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
         }
         startActivity(intent)
-        activity?.finish()
+        finish()
     }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        if (isListening) {
+            stopAudioMonitoring()
+        }
+        stopPlaybackInternal()
+
+        if (ScreenRecordingService.recordingCallback === this) {
+            ScreenRecordingService.recordingCallback = null
+        }
+    }
+
+    enum class SessionMode {
+        LISTEN_AUDIO,
+        UPLOAD_MEDIA,
+        WEBSITE_LINK,
+        SCREEN_RECORD
+    }
+
+    // endregion
 }

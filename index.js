@@ -38,12 +38,14 @@ const userRoutes = require('./src/routes/user');
 const reportRoutes = require('./src/routes/report')
 const sessionRoutes = require('./src/routes/session')
 const chatRoutes =  require('./src/routes/chat')
+const realtimeRoutes = require('./src/routes/realtime')
 
 app.use('/api/v1/users', userRoutes);
 app.use('/api/v1/auth', authRoutes);
 app.use('/api/v1/reports', reportRoutes);
 app.use('/api/v1/sessions',sessionRoutes)
 app.use('/api/v1/chats',chatRoutes)
+app.use('/api/v1/realtime',realtimeRoutes)
 
 app.listen(process.env.PORT, () => {
   console.log(`Server is running at http://localhost:${process.env.PORT}`);

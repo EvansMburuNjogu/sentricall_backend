@@ -81,8 +81,9 @@ const upload_session = async (req, res) => {
     session.mediaUploads = session.mediaUploads.concat(uploadedMedia);
 
     // ------------------------------------------------------
-    // If session was already scanned: just save files & reuse
-    // existing summary + risk level. No new AI call.
+    // 2) If session already scanned for upload_media:
+    //    - just save new files & reuse existing summary/risk
+    //    - no new AI call
     // ------------------------------------------------------
     if (session.scanned && session.type === 'upload_media') {
       await session.save();
@@ -99,8 +100,8 @@ const upload_session = async (req, res) => {
     }
 
     // ------------------------------------------------------
-    // 2) Prepare simple description for AI analysis
-    //    (We’re not reading file content here, just metadata)
+    // 3) Prepare simple description for AI analysis
+    //    (metadata only – no actual audio/video/image content)
     // ------------------------------------------------------
     const descriptionLines = uploadedMedia.map((m, idx) => {
       const sizeKB = Math.round(m.size / 1024);
@@ -112,15 +113,24 @@ const upload_session = async (req, res) => {
     let summaryText =
       'Your media has been uploaded successfully. SentriCall Copilot will help you review any suspicious content linked to these files.';
     let riskLevel = session.initialScanRiskLevel || 'UNKNOWN'; // default fallback
-    let embedding = []; // not used now, but keep field
+    // Embedding kept as placeholder (not used now, to avoid extra quota)
+    const embedding = [];
     let aiScanOk = false;
 
     // ------------------------------------------------------
-    // 3) Call OpenAI to get summary + risk level (metadata-based)
-    //    NO embeddings – avoids 429 quota for emb endpoint
+    // 4) Call OpenAI to get summary + risk level (metadata-based)
+    //    Uses OPENAI_CHAT_MODEL, strict JSON output
     // ------------------------------------------------------
-    try {
-      const systemPrompt = `
+    const hasOpenAIKey = Boolean(process.env.OPENAI_KEY);
+    const chatModel = process.env.OPENAI_CHAT_MODEL || 'gpt-4.1-mini';
+
+    if (!hasOpenAIKey) {
+      console.warn(
+        '[upload_session] OPENAI_KEY not set – skipping AI scan, keeping defaults'
+      );
+    } else {
+      try {
+        const systemPrompt = `
 You are SentriCall Copilot, an AI safety assistant.
 You help users understand and avoid scams, fraud and social engineering.
 
@@ -135,30 +145,40 @@ Return ONLY valid JSON with:
   "summary": "short explanation to the user...",
   "riskLevel": "LOW" | "MEDIUM" | "HIGH" | "UNKNOWN"
 }
-`;
+`.trim();
 
-      const userPrompt = `
-Analyze the following uploaded media and respond ONLY with JSON:
+        const userPrompt = `
+Analyze the following uploaded media metadata and respond ONLY with JSON:
 
 ${combinedDescription}
-`;
+`.trim();
 
-      const completion = await openai.chat.completions.create({
-        model: 'gpt-4.1-mini',
-        temperature: 0.2,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userPrompt },
-        ],
-      });
+        const completion = await openai.chat.completions.create({
+          model: chatModel,
+          temperature: 0.2,
+          response_format: { type: 'json_object' },
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userPrompt },
+          ],
+        });
 
-      const raw = completion?.choices?.[0]?.message?.content || '';
+        const raw = completion?.choices?.[0]?.message?.content || '{}';
 
-      try {
-        const parsed = JSON.parse(raw);
+        let parsed;
+        try {
+          parsed = JSON.parse(raw);
+        } catch (jsonErr) {
+          console.error(
+            '[upload_session] Failed to parse JSON from Copilot:',
+            raw
+          );
+          parsed = {};
+        }
 
         if (parsed && typeof parsed.summary === 'string') {
-          summaryText = parsed.summary.trim() || summaryText;
+          const trimmed = parsed.summary.trim();
+          if (trimmed) summaryText = trimmed;
         }
 
         if (
@@ -170,30 +190,27 @@ ${combinedDescription}
         ) {
           riskLevel = parsed.riskLevel.toUpperCase();
         }
-      } catch (jsonErr) {
-        console.error('upload_session: failed to parse JSON from Copilot', raw);
-        // keep fallback summaryText + riskLevel
-      }
 
-      aiScanOk = true; // ✅ only here, when chat call succeeds
-    } catch (aiErr) {
-      console.error('upload_session: OpenAI summary error', aiErr);
-      // AI failed (429 / quota / network) – leave aiScanOk = false
+        aiScanOk = true; // ✅ AI call succeeded
+      } catch (aiErr) {
+        console.error('[upload_session] OpenAI summary error', aiErr);
+        // AI failed (429 / quota / network) – keep defaults, aiScanOk = false
+      }
     }
 
     // ------------------------------------------------------
-    // 4) Persist the updated session (summary + risk + scanned)
+    // 5) Persist updated session (summary + risk + scanned flag)
     // ------------------------------------------------------
     if (session.type === 'upload_media') {
       session.initialScanSummary = summaryText;
       session.initialScanRiskLevel = riskLevel;
-      session.scanned = aiScanOk; // 👈 only true if AI summary succeeded
+      session.scanned = aiScanOk; // true only when AI succeeded
     }
 
     await session.save();
 
     // ------------------------------------------------------
-    // 5) Save an assistant Conversation for this upload
+    // 6) Save an assistant Conversation for this upload
     // ------------------------------------------------------
     const assistantConversation = await Conversation.create({
       sessionId: session._id,
