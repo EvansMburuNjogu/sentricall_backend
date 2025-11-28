@@ -1,12 +1,17 @@
 const express = require('express');
 const mongoose = require('mongoose')
 require('dotenv').config();
+const path = require('path');
 const app = express();
 
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+app.use(
+  '/uploads',
+  express.static(path.join(__dirname, 'uploads'))
+);
 mongoose.connect(process.env.DB, {
     serverSelectionTimeoutMS: 5000,
     maxPoolSize: 25,

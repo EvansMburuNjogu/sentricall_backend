@@ -1,6 +1,55 @@
 // models/session.js
 const mongoose = require('mongoose');
 
+const MediaUploadSchema = new mongoose.Schema(
+  {
+    fieldName: {
+      type: String,
+      default: null,
+    },
+    originalName: {
+      type: String,
+      required: true,
+    },
+    filename: {
+      type: String,
+      required: true,
+      index: true,
+    },
+    mimetype: {
+      type: String,
+      required: true,
+    },
+    size: {
+      type: Number,
+      required: true,
+    },
+    // e.g. "uploads/sessions/abc123.wav"
+    storagePath: {
+      type: String,
+      required: true,
+    },
+    // e.g. "/uploads/sessions/abc123.wav" — used by frontend
+    url: {
+      type: String,
+      required: true,
+    },
+    // "audio" | "image" | "video" | "other"
+    kind: {
+      type: String,
+      enum: ['audio', 'image', 'video', 'other'],
+      default: 'other',
+    },
+    uploadedAt: {
+      type: Date,
+      default: Date.now,
+    },
+  },
+  {
+    _id: false,
+  }
+);
+
 const SessionSchema = new mongoose.Schema(
   {
     // Owner
@@ -18,10 +67,7 @@ const SessionSchema = new mongoose.Schema(
       trim: true,
     },
 
-    /**
-     * Session type – these MUST match what the frontend sends:
-     *  listen_audio, upload_media, website_link, screen_record
-     */
+   
     type: {
       type: String,
       required: true,
@@ -35,7 +81,7 @@ const SessionSchema = new mongoose.Schema(
       default: null,
     },
 
-    // First AI summary from scan_website
+    // First AI summary from scan_website / upload_session
     initialScanSummary: {
       type: String,
       default: null,
@@ -51,7 +97,19 @@ const SessionSchema = new mongoose.Schema(
       default: 'UNKNOWN',
     },
 
-    // TTL – session auto-expires after 1 hour
+    
+    scanned: {
+      type: Boolean,
+      default: false,
+      index: true,
+    },
+
+    
+    mediaUploads: {
+      type: [MediaUploadSchema],
+      default: [],
+    },
+
     createdAt: {
       type: Date,
       default: Date.now,
@@ -59,7 +117,7 @@ const SessionSchema = new mongoose.Schema(
     },
   },
   {
-    // if you ever need updatedAt later
+    // we keep createdAt name stable, and get updatedAt automatically
     timestamps: { createdAt: 'createdAt', updatedAt: true },
   }
 );
